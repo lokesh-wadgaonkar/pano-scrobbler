@@ -1,0 +1,186 @@
+name: Build Merged Pano + Mornye APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      lastfm_key:
+        description: 'Optional: Your Last.fm API Key (leave default for local/ListenBrainz testing)'
+        required: false
+        default: '00000000000000000000000000000000'
+      lastfm_secret:
+        description: 'Optional: Your Last.fm API Secret'
+        required: false
+        default: '00000000000000000000000000000000'
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Forked Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Generate Required local.properties
+        run: |
+          cat << 'EOF' >> local.properties
+          lastfm.key=${{ inputs.lastfm_key }}
+          lastfm.secret=${{ inputs.lastfm_secret }}
+          spotify.refreshToken=dummy_token
+          EOF
+
+      - name: Inject Mornye Playtime Tracker & Database Engine
+        run: |
+          STATS_DIR="composeApp/src/androidMain/kotlin/com/arn/scrobble/mornye"
+          mkdir -p "$STATS_DIR"
+          cat << 'EOF' > "$STATS_DIR/MornyeEngine.kt"
+          package com.arn.scrobble.mornye
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.database.sqlite.SQLiteDatabase
+          import android.database.sqlite.SQLiteOpenHelper
+          import android.media.MediaMetadata
+          import android.media.session.PlaybackState
+          import android.os.SystemClock
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.launch
+          import java.time.Instant
+          import java.time.ZoneId
+          import java.time.format.DateTimeFormatter
+
+          class MornyeDbHelper(context: Context) :
+              SQLiteOpenHelper(context.applicationContext, "mornye_stats.db", null, 1) {
+
+              override fun onCreate(db: SQLiteDatabase) {
+                  db.execSQL("""
+                      CREATE TABLE IF NOT EXISTS mornye_playback_logs (
+                          id INTEGER PRIMARY KEY AUTOINCREMENT,
+                          title TEXT NOT NULL,
+                          artist TEXT NOT NULL,
+                          album TEXT NOT NULL,
+                          durationMs INTEGER NOT NULL,
+                          listenedMs INTEGER NOT NULL,
+                          timestamp INTEGER NOT NULL,
+                          dayEpoch INTEGER NOT NULL,
+                          monthKey INTEGER NOT NULL,
+                          yearKey INTEGER NOT NULL,
+                          hourOfDay INTEGER NOT NULL
+                      )
+                  """.trimIndent())
+                  db.execSQL("CREATE INDEX IF NOT EXISTS idx_ts ON mornye_playback_logs(timestamp)")
+                  db.execSQL("CREATE INDEX IF NOT EXISTS idx_day ON mornye_playback_logs(dayEpoch)")
+              }
+
+              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+
+              fun insertSession(
+                  title: String, artist: String, album: String,
+                  durationMs: Long, listenedMs: Long, timestamp: Long,
+                  dayEpoch: Long, monthKey: Int, yearKey: Int, hourOfDay: Int
+              ) {
+                  writableDatabase.insert("mornye_playback_logs", null, ContentValues().apply {
+                      put("title", title)
+                      put("artist", artist)
+                      put("album", album)
+                      put("durationMs", durationMs)
+                      put("listenedMs", listenedMs)
+                      put("timestamp", timestamp)
+                      put("dayEpoch", dayEpoch)
+                      put("monthKey", monthKey)
+                      put("yearKey", yearKey)
+                      put("hourOfDay", hourOfDay)
+                  })
+              }
+          }
+
+          object MornyePlaytimeTracker {
+              private var dbHelper: MornyeDbHelper? = null
+              private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+              private var currentTitle: String? = null
+              private var currentArtist: String? = null
+              private var currentAlbum: String? = null
+              private var currentDurationMs: Long = 0L
+              private var accumulatedMs: Long = 0L
+              private var playStartRealtimeMs: Long = 0L
+              private var isPlaying: Boolean = false
+
+              fun init(context: Context) {
+                  if (dbHelper == null) dbHelper = MornyeDbHelper(context)
+              }
+
+              fun onMetadataChanged(metadata: MediaMetadata?) {
+                  val newTitle = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)?.trim()
+                  val newArtist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST)?.trim()
+                  val newAlbum = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM)?.trim() ?: ""
+                  val newDuration = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+
+                  if (newTitle != currentTitle || newArtist != currentArtist) {
+                      flushSession()
+                      currentTitle = newTitle
+                      currentArtist = newArtist
+                      currentAlbum = newAlbum
+                      currentDurationMs = newDuration
+                      accumulatedMs = 0L
+                      if (isPlaying) playStartRealtimeMs = SystemClock.elapsedRealtime()
+                  }
+              }
+
+              fun onPlaybackStateChanged(state: PlaybackState?) {
+                  val nowPlaying = state?.state == PlaybackState.STATE_PLAYING
+                  val nowRealtime = SystemClock.elapsedRealtime()
+                  if (isPlaying && !nowPlaying) {
+                      accumulatedMs += (nowRealtime - playStartRealtimeMs).coerceAtLeast(0L)
+                      isPlaying = false
+                  } else if (!isPlaying && nowPlaying) {
+                      playStartRealtimeMs = nowRealtime
+                      isPlaying = true
+                  }
+              }
+
+              fun flushSession() {
+                  val nowRealtime = SystemClock.elapsedRealtime()
+                  if (isPlaying) {
+                      accumulatedMs += (nowRealtime - playStartRealtimeMs).coerceAtLeast(0L)
+                      playStartRealtimeMs = nowRealtime
+                  }
+                  val title = currentTitle ?: return
+                  val artist = currentArtist ?: return
+                  val played = accumulatedMs
+                  accumulatedMs = 0L
+                  if (played < 30_000L) return
+
+                  val nowMs = System.currentTimeMillis()
+                  val zdt = Instant.ofEpochMilli(nowMs).atZone(ZoneId.systemDefault())
+                  val dayEpoch = zdt.format(DateTimeFormatter.BASIC_ISO_DATE).toLong()
+                  val monthKey = zdt.year * 100 + zdt.monthValue
+                  val yearKey = zdt.year
+                  val hour = zdt.hour
+
+                  ioScope.launch {
+                      dbHelper?.insertSession(
+                          title, artist, currentAlbum ?: "", currentDurationMs,
+                          played, nowMs, dayEpoch, monthKey, yearKey, hour
+                      )
+                  }
+              }
+          }
+          EOF
+
+      - name: Compile Debug APK (Realme 12x 5G arm64-v8a)
+        run: ./gradlew assembleDebug -Pandroid.injected.abi=arm64-v8a -x lint --no-daemon
+
+      - name: Upload Compiled APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pano-Mornye-Merged-APK
+          path: "**/build/outputs/apk/**/*.apk"
