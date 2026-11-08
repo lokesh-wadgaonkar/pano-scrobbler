@@ -36,6 +36,12 @@ jobs:
           spotify.refreshToken=dummy_token
           EOF
 
+      # ---------------------------------------------------------------
+      # MORNYE: playtime tracker + database + media-session watcher.
+      # Nothing in Pano's own source files is edited. The watcher attaches
+      # to media sessions through Pano's existing notification-listener
+      # access, and starts itself via a provider in the debug manifest.
+      # ---------------------------------------------------------------
       - name: Inject Mornye Playtime Tracker & Database Engine
         run: |
           STATS_DIR="composeApp/src/androidMain/kotlin/com/arn/scrobble/mornye"
@@ -50,13 +56,12 @@ jobs:
           import android.media.MediaMetadata
           import android.media.session.PlaybackState
           import android.os.SystemClock
+          import android.util.Log
           import kotlinx.coroutines.CoroutineScope
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.SupervisorJob
           import kotlinx.coroutines.launch
-          import java.time.Instant
-          import java.time.ZoneId
-          import java.time.format.DateTimeFormatter
+          import java.util.Calendar
 
           class MornyeDbHelper(context: Context) :
               SQLiteOpenHelper(context.applicationContext, "mornye_stats.db", null, 1) {
@@ -103,85 +108,384 @@ jobs:
               }
           }
 
+          /**
+           * Tracks real listening time per media session (one entry per playing app),
+           * and writes one row to the database each time a track ends / changes / stops
+           * after at least 30 seconds of actual playback.
+           */
           object MornyePlaytimeTracker {
-              private var dbHelper: MornyeDbHelper? = null
-              private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-              private var currentTitle: String? = null
-              private var currentArtist: String? = null
-              private var currentAlbum: String? = null
-              private var currentDurationMs: Long = 0L
-              private var accumulatedMs: Long = 0L
-              private var playStartRealtimeMs: Long = 0L
-              private var isPlaying: Boolean = false
+              private const val TAG = "Mornye"
+              private const val MIN_LISTEN_MS = 30_000L
 
-              fun init(context: Context) {
-                  if (dbHelper == null) dbHelper = MornyeDbHelper(context)
+              private class TrackState {
+                  var title: String? = null
+                  var artist: String? = null
+                  var album: String = ""
+                  var durationMs: Long = 0L
+                  var accumulatedMs: Long = 0L
+                  var playStartRealtimeMs: Long = 0L
+                  var isPlaying: Boolean = false
               }
 
-              fun onMetadataChanged(metadata: MediaMetadata?) {
+              private var dbHelper: MornyeDbHelper? = null
+              private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+              private val sessions = HashMap<String, TrackState>()
+
+              fun init(context: Context) {
+                  synchronized(this) {
+                      if (dbHelper == null) dbHelper = MornyeDbHelper(context)
+                  }
+              }
+
+              fun onMetadataChanged(sessionKey: String, metadata: MediaMetadata?) {
                   val newTitle = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)?.trim()
-                  val newArtist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST)?.trim()
+                  val newArtist = (metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST)?.takeIf { it.isNotBlank() }
+                      ?: metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST))?.trim()
                   val newAlbum = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM)?.trim() ?: ""
                   val newDuration = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
 
-                  if (newTitle != currentTitle || newArtist != currentArtist) {
-                      flushSession()
-                      currentTitle = newTitle
-                      currentArtist = newArtist
-                      currentAlbum = newAlbum
-                      currentDurationMs = newDuration
-                      accumulatedMs = 0L
-                      if (isPlaying) playStartRealtimeMs = SystemClock.elapsedRealtime()
+                  synchronized(this) {
+                      val s = sessions.getOrPut(sessionKey) { TrackState() }
+                      if (newTitle != s.title || newArtist != s.artist) {
+                          // A different track started: save the previous one first.
+                          flushLocked(s)
+                          s.title = newTitle
+                          s.artist = newArtist
+                          s.album = newAlbum
+                          s.durationMs = newDuration
+                          s.accumulatedMs = 0L
+                          if (s.isPlaying) s.playStartRealtimeMs = SystemClock.elapsedRealtime()
+                      } else {
+                          // Same track; many apps send album / duration a moment later.
+                          if (newDuration > 0L) s.durationMs = newDuration
+                          if (newAlbum.isNotEmpty()) s.album = newAlbum
+                      }
                   }
               }
 
-              fun onPlaybackStateChanged(state: PlaybackState?) {
-                  val nowPlaying = state?.state == PlaybackState.STATE_PLAYING
-                  val nowRealtime = SystemClock.elapsedRealtime()
-                  if (isPlaying && !nowPlaying) {
-                      accumulatedMs += (nowRealtime - playStartRealtimeMs).coerceAtLeast(0L)
-                      isPlaying = false
-                  } else if (!isPlaying && nowPlaying) {
-                      playStartRealtimeMs = nowRealtime
-                      isPlaying = true
+              fun onPlaybackStateChanged(sessionKey: String, state: PlaybackState?) {
+                  val code = state?.state ?: PlaybackState.STATE_NONE
+                  val nowPlaying = code == PlaybackState.STATE_PLAYING
+                  val now = SystemClock.elapsedRealtime()
+
+                  synchronized(this) {
+                      val s = sessions.getOrPut(sessionKey) { TrackState() }
+                      if (s.isPlaying && !nowPlaying) {
+                          s.accumulatedMs += (now - s.playStartRealtimeMs).coerceAtLeast(0L)
+                          s.isPlaying = false
+                      } else if (!s.isPlaying && nowPlaying) {
+                          s.playStartRealtimeMs = now
+                          s.isPlaying = true
+                      }
+                      // Paused keeps accumulating when resumed; stopped/error ends the listen.
+                      if (code == PlaybackState.STATE_STOPPED ||
+                          code == PlaybackState.STATE_NONE ||
+                          code == PlaybackState.STATE_ERROR
+                      ) {
+                          flushLocked(s)
+                      }
                   }
               }
 
-              fun flushSession() {
-                  val nowRealtime = SystemClock.elapsedRealtime()
-                  if (isPlaying) {
-                      accumulatedMs += (nowRealtime - playStartRealtimeMs).coerceAtLeast(0L)
-                      playStartRealtimeMs = nowRealtime
+              fun onSessionEnded(sessionKey: String) {
+                  synchronized(this) {
+                      val s = sessions.remove(sessionKey) ?: return
+                      flushLocked(s)
                   }
-                  val title = currentTitle ?: return
-                  val artist = currentArtist ?: return
-                  val played = accumulatedMs
-                  accumulatedMs = 0L
-                  if (played < 30_000L) return
+              }
+
+              /** Must be called while holding the lock on this object. */
+              private fun flushLocked(s: TrackState) {
+                  val now = SystemClock.elapsedRealtime()
+                  if (s.isPlaying) {
+                      s.accumulatedMs += (now - s.playStartRealtimeMs).coerceAtLeast(0L)
+                      s.playStartRealtimeMs = now
+                  }
+                  val played = s.accumulatedMs
+                  s.accumulatedMs = 0L
+
+                  val title = s.title ?: return
+                  val artist = s.artist ?: return
+                  if (title.isBlank() || artist.isBlank()) return
+                  if (played < MIN_LISTEN_MS) return
+                  val helper = dbHelper ?: return
+
+                  // Copy everything now: the state object is reused for the next track.
+                  val album = s.album
+                  val durationMs = s.durationMs
 
                   val nowMs = System.currentTimeMillis()
-                  val zdt = Instant.ofEpochMilli(nowMs).atZone(ZoneId.systemDefault())
-                  val dayEpoch = zdt.format(DateTimeFormatter.BASIC_ISO_DATE).toLong()
-                  val monthKey = zdt.year * 100 + zdt.monthValue
-                  val yearKey = zdt.year
-                  val hour = zdt.hour
+                  val cal = Calendar.getInstance().apply { timeInMillis = nowMs }
+                  val year = cal.get(Calendar.YEAR)
+                  val month = cal.get(Calendar.MONTH) + 1
+                  val day = cal.get(Calendar.DAY_OF_MONTH)
+                  val hour = cal.get(Calendar.HOUR_OF_DAY)
+                  val dayEpoch = (year * 10000L) + (month * 100L) + day // e.g. 20261108
+                  val monthKey = year * 100 + month                      // e.g. 202611
 
                   ioScope.launch {
-                      dbHelper?.insertSession(
-                          title, artist, currentAlbum ?: "", currentDurationMs,
-                          played, nowMs, dayEpoch, monthKey, yearKey, hour
-                      )
+                      try {
+                          helper.insertSession(
+                              title, artist, album, durationMs,
+                              played, nowMs, dayEpoch, monthKey, year, hour
+                          )
+                          Log.d(TAG, "Saved: $artist - $title (${played / 1000}s listened)")
+                      } catch (e: Exception) {
+                          Log.e(TAG, "Failed to save playback log", e)
+                      }
                   }
               }
           }
           EOF
+          cat << 'EOF' > "$STATS_DIR/MornyeSessionWatcher.kt"
+          package com.arn.scrobble.mornye
+
+          import android.content.ComponentName
+          import android.content.ContentProvider
+          import android.content.ContentValues
+          import android.content.Context
+          import android.database.Cursor
+          import android.media.MediaMetadata
+          import android.media.session.MediaController
+          import android.media.session.MediaSession
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+
+          /**
+           * Listens to every active media session using Pano's own notification-listener
+           * component (access the user already granted to Pano), and feeds the events
+           * into MornyePlaytimeTracker. Nothing in Pano's own code is modified.
+           */
+          object MornyeSessionWatcher {
+              private const val TAG = "Mornye"
+              private const val NL_SERVICE_CLASS = "com.arn.scrobble.media.NLService"
+              private const val RETRY_DELAY_MS = 15_000L
+
+              private class Watched(
+                  val key: String,
+                  val controller: MediaController,
+                  val callback: MediaController.Callback
+              )
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val watched = HashMap<MediaSession.Token, Watched>()
+              private var appContext: Context? = null
+              private var started = false
+              private var listenerAdded = false
+
+              private val sessionsListener =
+                  MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+                      syncSessions(controllers ?: emptyList())
+                  }
+
+              private val attachRunnable = object : Runnable {
+                  override fun run() {
+                      // Notification access may not be granted yet; keep retrying quietly.
+                      if (!tryAttach()) handler.postDelayed(this, RETRY_DELAY_MS)
+                  }
+              }
+
+              fun start(context: Context) {
+                  if (started) return
+                  started = true
+                  val app = context.applicationContext ?: context
+                  appContext = app
+                  MornyePlaytimeTracker.init(app)
+                  handler.post(attachRunnable)
+              }
+
+              @Synchronized
+              private fun tryAttach(): Boolean {
+                  val ctx = appContext ?: return true
+                  return try {
+                      val manager = ctx.getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+                      val listener = ComponentName(ctx, NL_SERVICE_CLASS)
+                      if (!listenerAdded) {
+                          manager.addOnActiveSessionsChangedListener(sessionsListener, listener, handler)
+                          listenerAdded = true
+                      }
+                      syncSessions(manager.getActiveSessions(listener))
+                      Log.i(TAG, "Attached to media sessions")
+                      true
+                  } catch (e: SecurityException) {
+                      false
+                  } catch (e: Exception) {
+                      Log.w(TAG, "Could not attach yet, will retry", e)
+                      false
+                  }
+              }
+
+              @Synchronized
+              private fun syncSessions(controllers: List<MediaController>) {
+                  val live = HashSet<MediaSession.Token>()
+
+                  for (controller in controllers) {
+                      val token = controller.sessionToken
+                      live.add(token)
+                      if (watched.containsKey(token)) continue
+
+                      val key = "${controller.packageName}#${token.hashCode()}"
+                      val callback = object : MediaController.Callback() {
+                          override fun onMetadataChanged(metadata: MediaMetadata?) {
+                              MornyePlaytimeTracker.onMetadataChanged(key, metadata)
+                          }
+
+                          override fun onPlaybackStateChanged(state: PlaybackState?) {
+                              MornyePlaytimeTracker.onPlaybackStateChanged(key, state)
+                          }
+                      }
+                      controller.registerCallback(callback, handler)
+                      watched[token] = Watched(key, controller, callback)
+
+                      // Seed with whatever the session is doing right now.
+                      MornyePlaytimeTracker.onPlaybackStateChanged(key, controller.playbackState)
+                      MornyePlaytimeTracker.onMetadataChanged(key, controller.metadata)
+                  }
+
+                  // Sessions that went away: stop listening and save what they had.
+                  val iterator = watched.entries.iterator()
+                  while (iterator.hasNext()) {
+                      val entry = iterator.next()
+                      if (!live.contains(entry.key)) {
+                          val w = entry.value
+                          try {
+                              w.controller.unregisterCallback(w.callback)
+                          } catch (e: Exception) {
+                              // already gone
+                          }
+                          MornyePlaytimeTracker.onSessionEnded(w.key)
+                          iterator.remove()
+                      }
+                  }
+              }
+          }
+
+          /**
+           * Starts the watcher automatically when the app process starts
+           * (declared in the debug manifest), so no Pano source file needs editing.
+           */
+          class MornyeInitProvider : ContentProvider() {
+              override fun onCreate(): Boolean {
+                  val ctx = context
+                  if (ctx != null) MornyeSessionWatcher.start(ctx)
+                  return true
+              }
+
+              override fun query(
+                  uri: Uri, projection: Array<out String>?, selection: String?,
+                  selectionArgs: Array<out String>?, sortOrder: String?
+              ): Cursor? = null
+
+              override fun getType(uri: Uri): String? = null
+
+              override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+
+              override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+
+              override fun update(
+                  uri: Uri, values: ContentValues?, selection: String?,
+                  selectionArgs: Array<out String>?
+              ): Int = 0
+          }
+          EOF
+
+      - name: Register Mornye auto-start in the debug manifest
+        run: |
+          MANIFEST="androidApp/src/debug/AndroidManifest.xml"
+          PROVIDER='<provider android:name="com.arn.scrobble.mornye.MornyeInitProvider" android:authorities="${applicationId}.mornye-init" android:exported="false" />'
+          if [ -f "$MANIFEST" ]; then
+            echo "Existing debug manifest found: inserting provider"
+            if ! grep -q '</application>' "$MANIFEST"; then
+              echo "::error::$MANIFEST has no </application> tag to insert into"
+              exit 1
+            fi
+            sed -i "s#</application>#    ${PROVIDER}\n    </application>#" "$MANIFEST"
+          else
+            echo "No debug manifest yet: creating one"
+            mkdir -p "$(dirname "$MANIFEST")"
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="utf-8"?>' \
+              '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
+              '    <application>' \
+              "        ${PROVIDER}" \
+              '    </application>' \
+              '</manifest>' > "$MANIFEST"
+          fi
+          echo "---- $MANIFEST ----"
+          cat "$MANIFEST"
 
       - name: Compile Debug APK (Realme 12x 5G arm64-v8a)
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug -Pandroid.injected.abi=arm64-v8a -x lint --no-daemon
-      - name: Upload Compiled APK Artifact
+
+      # ---------------------------------------------------------------
+      # SIGNING: the Gradle build outputs "...-debug-unsigned.apk", which
+      # Android refuses to install ("package appears to be invalid").
+      # These steps sign it so it installs on your phone.
+      # The keystore is cached between runs, so every new build has the
+      # SAME signature and installs over the previous one (no uninstall).
+      # ---------------------------------------------------------------
+      - name: Restore signing keystore from cache
+        id: keystore-cache
+        uses: actions/cache@v4
+        with:
+          path: mornye-debug.jks
+          key: mornye-debug-keystore-v1
+
+      - name: Create signing keystore (first run only)
+        if: steps.keystore-cache.outputs.cache-hit != 'true'
+        run: |
+          keytool -genkeypair -v \
+            -keystore mornye-debug.jks \
+            -storepass android -keypass android \
+            -alias mornye -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Mornye Debug, O=Pano Mornye, C=IN"
+
+      - name: Align and sign APK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          BT="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)"
+          echo "Using build-tools: $BT"
+
+          mkdir -p signed-apk
+          mapfile -t APKS < <(find . -path '*/build/outputs/apk/debug/*.apk')
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "No debug APK found to sign" >&2
+            exit 1
+          fi
+
+          for APK in "${APKS[@]}"; do
+            # Sanity check: is the Mornye auto-start provider in the built manifest?
+            if { unzip -p "$APK" AndroidManifest.xml | strings -el; unzip -p "$APK" AndroidManifest.xml | strings; } | grep -q MornyeInitProvider; then
+              echo "OK: MornyeInitProvider is registered in $APK"
+            else
+              echo "::warning::MornyeInitProvider NOT found in the built manifest of $APK. Tracking will not start."
+            fi
+
+            NAME="$(basename "$APK" .apk)"
+            NAME="${NAME%-unsigned}"
+            "$BT/zipalign" -p -f 4 "$APK" "signed-apk/${NAME}-aligned.apk"
+            "$BT/apksigner" sign \
+              --ks mornye-debug.jks \
+              --ks-pass pass:android \
+              --key-pass pass:android \
+              --ks-key-alias mornye \
+              --out "signed-apk/${NAME}-signed.apk" \
+              "signed-apk/${NAME}-aligned.apk"
+            rm -f "signed-apk/${NAME}-aligned.apk"
+            "$BT/apksigner" verify -v "signed-apk/${NAME}-signed.apk"
+          done
+
+          ls -lh signed-apk
+
+      - name: Upload Signed APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Pano-Mornye-Merged-APK
-          path: "**/build/outputs/apk/**/*.apk"
+          path: signed-apk/*-signed.apk
